@@ -1,0 +1,34 @@
+name: Verify R2 publication access
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: backend/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: backend
+      - name: Read and validate existing publication pointer (no writes)
+        run: pnpm --filter @vocaltv/public-epg-publisher exec tsx ../../scripts/verify-r2.ts
+        working-directory: backend
+        env:
+          EPG_PUBLISHER_R2_ACCOUNT_ID: ${{ secrets.EPG_PUBLISHER_R2_ACCOUNT_ID }}
+          EPG_PUBLISHER_R2_BUCKET: ${{ secrets.EPG_PUBLISHER_R2_BUCKET }}
+          EPG_PUBLISHER_R2_ACCESS_KEY_ID: ${{ secrets.EPG_PUBLISHER_R2_ACCESS_KEY_ID }}
+          EPG_PUBLISHER_R2_SECRET_ACCESS_KEY: ${{ secrets.EPG_PUBLISHER_R2_SECRET_ACCESS_KEY }}

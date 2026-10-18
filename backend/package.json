@@ -1,0 +1,12 @@
+{
+  "name": "chattv-public-epg-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.12.2",
+  "scripts": {
+    "test": "pnpm --filter @vocaltv/public-epg-publisher test",
+    "typecheck": "pnpm --filter @vocaltv/public-epg-publisher build",
+    "publish:epg": "pnpm --filter @vocaltv/public-epg-publisher run publish"
+  }
+}

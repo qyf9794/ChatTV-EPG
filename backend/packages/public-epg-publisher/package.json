@@ -1,0 +1,27 @@
+{
+  "name": "@vocaltv/public-epg-publisher",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./s3-store": { "types": "./src/s3-store.ts", "default": "./dist/packages/public-epg-publisher/src/s3-store.js" },
+    "./maintenance-upload": { "types": "./src/maintenance-upload.ts", "default": "./dist/packages/public-epg-publisher/src/maintenance-upload.js" }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:runtime": "tsc -p tsconfig.runtime.json",
+    "test": "tsx --test test/*.test.ts",
+    "publish": "tsx src/run.ts",
+    "dry-run-local": "tsx src/run-local.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.842.0",
+    "@vocaltv/public-epg-contract": "workspace:*",
+    "saxes": "6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

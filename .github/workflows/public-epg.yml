@@ -1,0 +1,59 @@
+name: Public EPG publication
+
+on:
+  schedule:
+    - cron: "17 */12 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Publish fresh sources, or repair only the current source-name companion"
+        type: choice
+        options:
+          - publish
+          - backfill-source-names
+        default: publish
+
+concurrency:
+  group: public-epg-publisher
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: >-
+      (github.event_name == 'workflow_dispatch' || vars.PUBLIC_EPG_PUBLISH_ENABLED == 'true') &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    # v2's complete source-local graph is larger than the former matched subset.
+    # Provider operations, bytes and storage remain independently bounded.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: backend/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile --filter @vocaltv/public-epg-publisher...
+        working-directory: backend
+      - name: Publish fixed public artifacts
+        run: |
+          if [ "$PUBLISH_MODE" = "backfill-source-names" ]; then
+            pnpm --filter @vocaltv/public-epg-publisher run publish --backfill-source-names
+          else
+            pnpm --filter @vocaltv/public-epg-publisher run publish
+          fi
+        working-directory: backend
+        env:
+          PUBLISH_MODE: ${{ inputs.mode || 'publish' }}
+          EPG_PUBLISHER_R2_ACCOUNT_ID: ${{ secrets.EPG_PUBLISHER_R2_ACCOUNT_ID }}
+          EPG_PUBLISHER_R2_BUCKET: ${{ secrets.EPG_PUBLISHER_R2_BUCKET }}
+          EPG_PUBLISHER_R2_ACCESS_KEY_ID: ${{ secrets.EPG_PUBLISHER_R2_ACCESS_KEY_ID }}
+          EPG_PUBLISHER_R2_SECRET_ACCESS_KEY: ${{ secrets.EPG_PUBLISHER_R2_SECRET_ACCESS_KEY }}
