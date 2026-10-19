@@ -5,6 +5,8 @@ import {
   PutObjectCommand,
   S3Client
 } from "@aws-sdk/client-s3";
+import { addAbortSignal, Readable } from "node:stream";
+import { finished } from "node:stream/promises";
 import { PUBLIC_EPG_PREFIX } from "@vocaltv/public-epg-contract";
 import type { ObjectMetadata, RetentionObjectStore } from "./encoding.js";
 
@@ -38,51 +40,63 @@ export class R2ObjectStore implements RetentionObjectStore {
       region: "auto",
       endpoint: `https://${options.accountID}.r2.cloudflarestorage.com`,
       credentials: { accessKeyId: options.accessKeyID, secretAccessKey: options.secretAccessKey },
-      // Each counted call is exactly one network attempt. A failed operation
-      // retains the prior publication; a later job can retry within its budget.
+      // Each counted call is exactly one network attempt. Retry decisions stay
+      // with the caller so every attempt remains inside its request/time budget.
       maxAttempts: 1
     });
   }
 
   private async getObject(key: string, maximumBytes: number): Promise<{ value: Uint8Array; etag: string } | null> {
-    let result;
+    const controller = new AbortController();
+    // The SDK resolves send() once response headers arrive. Keep the same
+    // deadline alive until the response body has also finished or been closed.
+    const timeout = setTimeout(() => controller.abort(new DOMException("R2 GET timed out", "TimeoutError")), this.requestTimeoutMs);
+    let body: Readable | undefined;
+    let bodyFinished: Promise<void> | undefined;
     try {
-      result = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }), { abortSignal: AbortSignal.timeout(this.requestTimeoutMs) });
-    } catch (error) {
-      const value = error as { name?: string; $metadata?: { httpStatusCode?: number } };
-      if (value.name === "NoSuchKey" || value.name === "NotFound" || value.$metadata?.httpStatusCode === 404) return null;
-      throw providerFailure("r2_get_failed", error);
-    }
-    if (typeof result.ContentLength === "number" && (result.ContentLength < 0 || result.ContentLength > maximumBytes)) {
-      const body = result.Body as unknown as { destroy?: () => void; cancel?: () => Promise<void> } | undefined;
-      body?.destroy?.();
-      await body?.cancel?.().catch(() => undefined);
-      throw new Error("r2_object_size_invalid");
-    }
-    if (!result.Body) return null;
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    try {
-      for await (const chunk of result.Body as AsyncIterable<Uint8Array>) {
+      let result;
+      try {
+        result = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }), { abortSignal: controller.signal });
+      } catch (error) {
+        const value = error as { name?: string; $metadata?: { httpStatusCode?: number } };
+        if (!controller.signal.aborted && (value.name === "NoSuchKey" || value.name === "NotFound" || value.$metadata?.httpStatusCode === 404)) return null;
+        throw error;
+      }
+      if (result.Body) {
+        body = result.Body instanceof Readable ? result.Body
+          : Readable.fromWeb(result.Body as Parameters<typeof Readable.fromWeb>[0]);
+        // Observe close before aborting, including a response arriving after the
+        // deadline. Await this below so no body survives the store operation.
+        bodyFinished = finished(body, { cleanup: true }).catch(() => undefined);
+        addAbortSignal(controller.signal, body);
+      }
+      controller.signal.throwIfAborted();
+      if (typeof result.ContentLength === "number" && (result.ContentLength < 0 || result.ContentLength > maximumBytes)) {
+        throw new Error("r2_object_size_invalid");
+      }
+      if (!body) return null;
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      for await (const chunk of body as AsyncIterable<Uint8Array>) {
         total += chunk.byteLength;
-        if (total > maximumBytes) {
-          const body = result.Body as unknown as { destroy?: () => void; cancel?: () => Promise<void> };
-          body.destroy?.();
-          await body.cancel?.().catch(() => undefined);
-          throw new Error("r2_object_size_invalid");
-        }
+        if (total > maximumBytes) throw new Error("r2_object_size_invalid");
         chunks.push(new Uint8Array(chunk));
       }
+      controller.signal.throwIfAborted();
+      if (typeof result.ContentLength === "number" && total !== result.ContentLength) throw new Error("r2_object_size_invalid");
+      if (!result.ETag) throw new Error("r2_etag_missing");
+      const value = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) { value.set(chunk, offset); offset += chunk.byteLength; }
+      return { value, etag: result.ETag };
     } catch (error) {
-      if (error instanceof Error && error.message === "r2_object_size_invalid") throw error;
-      throw providerFailure("r2_get_failed", error);
+      if (error instanceof Error && (error.message === "r2_object_size_invalid" || error.message === "r2_etag_missing")) throw error;
+      throw providerFailure("r2_get_failed", controller.signal.aborted ? controller.signal.reason : error);
+    } finally {
+      clearTimeout(timeout);
+      body?.destroy();
+      await bodyFinished;
     }
-    if (typeof result.ContentLength === "number" && total !== result.ContentLength) throw new Error("r2_object_size_invalid");
-    if (!result.ETag) throw new Error("r2_etag_missing");
-    const value = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) { value.set(chunk, offset); offset += chunk.byteLength; }
-    return { value, etag: result.ETag };
   }
 
   async get(key: string, maximumBytes = DEFAULT_MAX_GET_BYTES): Promise<Uint8Array | null> {

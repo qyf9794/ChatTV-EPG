@@ -19,7 +19,10 @@ try {
   const result = await (args[0] === "--backfill-source-names"
     ? backfillProgrammeNameCompanion({ store, onProgress })
     : runPublisher({ store, onProgress }));
-  process.stdout.write(JSON.stringify({ ok: true, ...result }) + "\n");
+  const cleanupFailed = "retentionStatus" in result && result.retentionStatus === "failed";
+  process.stdout.write(JSON.stringify({ ok: !cleanupFailed, publicationOK: true, ...result }) + "\n");
+  // Keep cleanup failures visible to Actions while reporting the committed revision.
+  if (cleanupFailed) process.exitCode = 1;
 } catch (error) {
   process.stderr.write(JSON.stringify({ ok: false, error: safeError(error) }) + "\n");
   process.exitCode = 1;
