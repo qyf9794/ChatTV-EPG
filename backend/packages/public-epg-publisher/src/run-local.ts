@@ -31,7 +31,9 @@ try {
     budgets: { maxR2GetRequests: localReadBudget, maxR2PutRequests: localWriteBudget },
     onProgress
   });
-  process.stdout.write(JSON.stringify({ ok: true, storeMode: "local", temporaryStore, ...result }) + "\n");
+  const cleanupFailed = result.retentionStatus === "failed";
+  process.stdout.write(JSON.stringify({ ok: !cleanupFailed, publicationOK: true, storeMode: "local", temporaryStore, ...result }) + "\n");
+  if (cleanupFailed) process.exitCode = 1;
 } catch (error) {
   process.stderr.write(JSON.stringify({ ok: false, storeMode: "local", error: safeError(error) }) + "\n");
   process.exitCode = 1;

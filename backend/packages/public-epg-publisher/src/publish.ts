@@ -97,7 +97,7 @@ import {
   publicAccessGraphMatches,
   PUBLIC_ACCESS_INDEX_VERSION
 } from "./streams.js";
-import { runRetention } from "./retention.js";
+import { RetentionFailure, runRetention, type RetentionStage } from "./retention.js";
 import { assertStorageHeadroom } from "./storage-budget.js";
 import { BoundedSemaphore, mapBounded } from "./bounded.js";
 import { buildWikidataSuggestionIndex, fetchWikidataSuggestions } from "./wikidata.js";
@@ -159,12 +159,18 @@ type PublisherUsage = {
 };
 
 export type PublisherProgress = Partial<PublisherUsage> & {
-  phase: "publisher" | "upstream" | "r2" | "sources" | "validation";
+  phase: "publisher" | "upstream" | "r2" | "sources" | "validation" | "publication" | "retention";
   limits?: PublisherRunLimits;
   metadataNameValidation?: MetadataNameValidationDiagnostic;
   sourcesCompleted?: number;
   sourceTotal?: number;
   programmesParsedInSource?: number;
+  revision?: string;
+  published?: boolean;
+  retentionStatus?: PublisherSummary["retentionStatus"];
+  retentionError?: string | null;
+  retentionErrorKey?: string | null;
+  retentionFailureStage?: PublisherSummary["retentionFailureStage"];
 };
 
 export class BudgetedObjectStore implements VerifiedArtifactStore, RetentionObjectStore {
@@ -209,8 +215,7 @@ export class BudgetedObjectStore implements VerifiedArtifactStore, RetentionObje
       const cached = this.getCachedObject(key, maximumBytes ?? 64 * 1024 * 1024);
       if (cached) return cached;
     }
-    this.usage.r2Gets += 1;
-    if (this.usage.r2Gets > this.limits.maxR2GetRequests) throw new Error("publisher_r2_get_budget_exceeded");
+    this.reserveRead();
     this.reportR2Progress();
     const value = await this.inner.get(key, maximumBytes);
     this.recordRead(value?.byteLength ?? 0);
@@ -219,8 +224,7 @@ export class BudgetedObjectStore implements VerifiedArtifactStore, RetentionObje
   }
 
   async getWithETag(key: string, maximumBytes: number): Promise<{ value: Uint8Array; etag: string } | null> {
-    this.usage.r2Gets += 1;
-    if (this.usage.r2Gets > this.limits.maxR2GetRequests) throw new Error("publisher_r2_get_budget_exceeded");
+    this.reserveRead();
     this.reportR2Progress();
     const value = await this.inner.getWithETag(key, maximumBytes);
     this.recordRead(value?.value.byteLength ?? 0);
@@ -336,6 +340,14 @@ export class BudgetedObjectStore implements VerifiedArtifactStore, RetentionObje
     if (this.usage.r2GetBytes > this.limits.maxR2GetBytes) throw new Error("publisher_r2_read_byte_budget_exceeded");
   }
 
+  private reserveRead(): void {
+    if (this.usage.r2Gets >= this.limits.maxR2GetRequests) {
+      this.report("r2");
+      throw new Error("publisher_r2_get_budget_exceeded");
+    }
+    this.usage.r2Gets += 1;
+  }
+
   private reserveWrite(bytes: number): void {
     if (this.usage.r2Puts + 1 > this.limits.maxR2PutRequests
       || this.usage.r2PutBytes + bytes > this.limits.maxR2PutBytes) {
@@ -353,7 +365,7 @@ export class BudgetedObjectStore implements VerifiedArtifactStore, RetentionObje
     this.report("r2");
   }
 
-  report(phase: PublisherProgress["phase"], details: Pick<PublisherProgress, "sourcesCompleted" | "sourceTotal" | "programmesParsedInSource" | "metadataNameValidation" | "limits"> = {}): void {
+  report(phase: PublisherProgress["phase"], details: Omit<PublisherProgress, "phase" | keyof PublisherUsage> = {}): void {
     this.onProgress?.({ phase, ...this.usage, ...details });
   }
 }
@@ -554,6 +566,10 @@ export type PublisherSummary = {
   retentionNamespaceBytes: number | null;
   retentionStorageBudgetExceeded: boolean | null;
   retentionRan: boolean;
+  retentionStatus: "skipped" | "succeeded" | "failed";
+  retentionError: string | null;
+  retentionErrorKey: string | null;
+  retentionFailureStage: RetentionStage | "checkpoint" | null;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1968,26 +1984,48 @@ export async function runPublisher(options: {
   }
 
   const committedPointer = published ? pointer : current?.pointer ?? pointer;
+  // Pointer commit is the publication boundary. Cleanup reports its own result
+  // and must never roll back this committed publication.
+  usageStore.report("publication", { revision, published });
   const retainedPointers = [committedPointer, ...(nextState.previousPointers ?? [])]
     .filter((candidate, index, all) => all.findIndex((item) => item.manifestKey === candidate.manifestKey) === index)
     .slice(0, 2);
   const retainedStates: unknown[] = [nextState, ...(nextState.previousStates ?? [])].slice(0, 2);
-  const retention = retentionDue
-    ? await runRetention(usageStore, { pointers: retainedPointers, states: retainedStates }, renewLease, leaseClock())
-    : null;
-  if (retention) {
-    if (!committedStateETag) throw new Error("publisher_retention_state_missing");
-    const completedState: PublisherState = { ...nextState, lastRetentionAt: leaseClock() };
-    await renewLease();
+  let retention: Awaited<ReturnType<typeof runRetention>> | null = null;
+  let retentionStatus: PublisherSummary["retentionStatus"] = "skipped";
+  let retentionError: string | null = null, retentionErrorKey: string | null = null;
+  let retentionFailureStage: PublisherSummary["retentionFailureStage"] = null;
+  if (retentionDue) {
+    retentionFailureStage = "mark";
     try {
-      await usageStore.putConditional(PUBLIC_EPG_PUBLISHER_STATE_KEY, jsonBytes(completedState), {
-        contentType: "application/json", cacheControl: "private, no-store"
-      }, { ifMatch: committedStateETag });
+      retention = await runRetention(usageStore, { pointers: retainedPointers, states: retainedStates }, renewLease, leaseClock());
+      retentionFailureStage = "checkpoint";
+      if (!committedStateETag) throw new Error("publisher_retention_state_missing");
+      const completedState: PublisherState = { ...nextState, lastRetentionAt: leaseClock() };
+      await renewLease();
+      retentionErrorKey = PUBLIC_EPG_PUBLISHER_STATE_KEY;
+      try {
+        await usageStore.putConditional(PUBLIC_EPG_PUBLISHER_STATE_KEY, jsonBytes(completedState), {
+          contentType: "application/json", cacheControl: "private, no-store"
+        }, { ifMatch: committedStateETag });
+      } catch (error) {
+        if (error instanceof Error && error.message === "r2_precondition_failed") throw new Error("publisher_state_conflict");
+        throw error;
+      }
+      retentionStatus = "succeeded";
+      retentionFailureStage = null;
+      retentionErrorKey = null;
     } catch (error) {
-      if (error instanceof Error && error.message === "r2_precondition_failed") throw new Error("publisher_state_conflict");
-      throw error;
+      retentionStatus = "failed";
+      retentionError = error instanceof Error && /^[a-z0-9_:-]{1,80}$/iu.test(error.message)
+        ? error.message : "retention_failed";
+      if (error instanceof RetentionFailure) {
+        retentionFailureStage = error.stage;
+        retentionErrorKey = error.key;
+      }
     }
   }
+  usageStore.report("retention", { revision, published, retentionStatus, retentionError, retentionErrorKey, retentionFailureStage });
 
   await lease.release(usageStore, leaseClock());
   released = true;
@@ -2031,7 +2069,11 @@ export async function runPublisher(options: {
     retentionObjects: retention?.objects ?? 0,
     retentionNamespaceBytes: retention?.namespaceBytes ?? null,
     retentionStorageBudgetExceeded: retention?.storageBudgetExceeded ?? null,
-    retentionRan: retention !== null
+    retentionRan: retentionDue,
+    retentionStatus,
+    retentionError,
+    retentionErrorKey,
+    retentionFailureStage
   };
   } finally {
     if (!released) await lease.release(usageStore, leaseClock());

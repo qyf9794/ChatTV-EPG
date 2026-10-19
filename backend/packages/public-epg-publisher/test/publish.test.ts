@@ -35,7 +35,8 @@ import {
   channelMetadataRevision,
   backfillProgrammeNameCompanion,
   runPublisher,
-  validateMetadataNameEntries
+  validateMetadataNameEntries,
+  type PublisherProgress
 } from "../src/publish.js";
 import { publicEpgSources } from "../src/sources.js";
 import { WIKIDATA_TV_CHANNEL_QUERY } from "../src/wikidata.js";
@@ -90,6 +91,37 @@ async function publishedObjects(store: MemoryObjectStore): Promise<{ pointer: Cu
   const manifestBytes = await store.get(pointer.manifestKey, 32 * 1024);
   assert.ok(manifestBytes);
   return { pointer, manifest: JSON.parse(new TextDecoder().decode(manifestBytes!)) as PublicEpgManifest };
+}
+
+function publisherStateForRetentionTest(store: MemoryObjectStore): {
+  sources: Record<string, Record<string, unknown>>;
+  lastRetentionAt?: number;
+} {
+  const stored = store.objects.get(PUBLIC_EPG_PUBLISHER_STATE_KEY);
+  assert.ok(stored);
+  return JSON.parse(new TextDecoder().decode(stored.value));
+}
+
+function addRetainedFixtureGraph(store: MemoryObjectStore, count: number): ArtifactRef[] {
+  const refs = Array.from({ length: count }, (_, index): ArtifactRef => {
+    const raw = jsonBytes({ retentionRegressionLeaf: index });
+    const value = new Uint8Array(gzipSync(raw));
+    const digest = sha256(value);
+    const key = PUBLIC_EPG_PREFIX + "objects/" + digest + ".json.gz";
+    store.objects.set(key, {
+      value,
+      metadata: { contentType: "application/json", contentEncoding: "gzip", cacheControl: "public, immutable" },
+      modifiedAt: 0
+    });
+    return { key, sha256: digest, bytes: raw.byteLength, compressedBytes: value.byteLength };
+  });
+  const stored = store.objects.get(PUBLIC_EPG_PUBLISHER_STATE_KEY)!;
+  const state = publisherStateForRetentionTest(store);
+  // Changing this source pins the fixture only in its prior snapshot, outside
+  // the run cache. Cached source validation permits extra graph fields.
+  state.sources[publicEpgSources[0]!.id]!.retentionRegressionRefs = refs;
+  store.objects.set(PUBLIC_EPG_PUBLISHER_STATE_KEY, { ...stored, value: jsonBytes(state) });
+  return refs;
 }
 
 function deleteReachableRoutedGraph(store: MemoryObjectStore, root: ArtifactRef): string[] {
@@ -147,6 +179,10 @@ test("first publish emits bounded canonical artifacts; unchanged sources keep po
   const firstTime = new Date("2026-10-01T12:00:00.000Z");
   const first = await runPublisher({ store, fetchImpl: upstream.fetch, now: () => firstTime });
   assert.equal(first.published, true);
+  assert.equal(first.retentionStatus, "succeeded");
+  assert.equal(first.retentionError, null);
+  assert.equal(first.retentionErrorKey, null);
+  assert.equal(first.retentionFailureStage, null);
   assert.equal(first.sourceCount, 18);
   assert.equal(first.metadataCount, 4);
   assert.equal(first.parsedSources, 18);
@@ -343,6 +379,10 @@ test("first publish emits bounded canonical artifacts; unchanged sources keep po
   assert.ok(next.r2GetRequests < 100, "no-change run avoids loading the full artifact graph");
   assert.ok(next.r2PutRequests > 0, "the bounded lease still renews");
   assert.equal(next.retentionRan, false);
+  assert.equal(next.retentionStatus, "skipped");
+  assert.equal(next.retentionError, null);
+  assert.equal(next.retentionErrorKey, null);
+  assert.equal(next.retentionFailureStage, null);
   assert.equal(next.r2ListRequests, 1); // storage admission; no retention enumeration
   assert.equal(next.r2DeleteRequests, 0);
   assert.equal([...upstream.conditionalRequests.values()].reduce((sum, count) => sum + count, 0), 22);
@@ -1192,4 +1232,218 @@ test("backfill fails closed on corrupt programme bytes and retains the current p
   await assert.rejects(backfillProgrammeNameCompanion({ store }));
   assert.equal(await store.get(key), null);
   assert.deepEqual(await store.get(PUBLIC_EPG_CURRENT_KEY), pointer);
+});
+
+
+test("retention timeout after publication drains active reads before releasing the lease", { timeout: 10_000 }, async () => {
+  const store = new MemoryObjectStore(), upstream = new FixedPublicUpstream();
+  const now = () => new Date("2026-10-01T12:00:00.000Z");
+  await runPublisher({ store, fetchImpl: upstream.fetch, now, leaseClock: () => 0 });
+  const pointerBefore = await store.get(PUBLIC_EPG_CURRENT_KEY);
+  const refs = addRetainedFixtureGraph(store, 20);
+  const fixtureKeys = new Set(refs.map((ref) => ref.key));
+  upstream.changedSourceIDs.add(publicEpgSources[0]!.id);
+  const clock = 60 * 60 * 60 * 1_000;
+  let startAllReads!: () => void, releaseInFlight!: () => void, reportFailure!: () => void;
+  const allReadsStarted = new Promise<void>((resolve) => { startAllReads = resolve; });
+  const inFlight = new Promise<void>((resolve) => { releaseInFlight = resolve; });
+  const failure = new Promise<void>((resolve) => { reportFailure = resolve; });
+  const read = store.get.bind(store), write = store.putConditional.bind(store);
+  const requested: string[] = [];
+  let active = 0, maxActive = 0, failures = 0, leaseReleased = false, settled = false;
+  store.get = async (key, maximum) => {
+    if (!fixtureKeys.has(key)) return read(key, maximum);
+    requested.push(key);
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    if (active === 8) startAllReads();
+    try {
+      if (key === refs[0]!.key) {
+        await allReadsStarted;
+        if (++failures === 3) reportFailure();
+        throw new Error("r2_get_failed:0:TimeoutError");
+      }
+      await inFlight;
+      return await read(key, maximum);
+    } finally { active -= 1; }
+  };
+  store.putConditional = async (key, value, metadata, condition) => {
+    if (key === PUBLIC_EPG_PREFIX + "publisher/lease.json"
+      && JSON.parse(new TextDecoder().decode(value)).expiresAt === clock) {
+      leaseReleased = true;
+      assert.equal(active, 0, "release must wait for every active retention GET to settle");
+    }
+    return write(key, value, metadata, condition);
+  };
+  const progress: PublisherProgress[] = [];
+  const publication = runPublisher({ store, fetchImpl: upstream.fetch, now, leaseClock: () => clock,
+    onProgress: (value) => progress.push(value) });
+  void publication.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    await Promise.race([failure, publication.then(() => { throw new Error("retention fixture was not read"); })]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(active, 7, "other reads remain in flight when the timeout retry limit is reached");
+    assert.equal(settled, false, "the failed run must join its active reads before returning");
+    assert.equal(leaseReleased, false);
+    assert.equal(requested.length, 10, "eight initial GETs plus two timeout retries exhaust the active batch only");
+    assert.ok(requested.every((key) => refs.slice(0, 8).some((ref) => ref.key === key)),
+      "the failed read must stop dispatching queued prior-graph GETs");
+  } finally { releaseInFlight(); }
+  const result = await publication;
+  assert.equal(maxActive, 8);
+  assert.equal(active, 0);
+  assert.equal(leaseReleased, true);
+  assert.equal(requested.length, 10, "no GET may escape after the retention failure or lease release");
+  assert.equal(result.published, true);
+  assert.equal(result.retentionRan, true);
+  assert.equal(result.retentionStatus, "failed");
+  assert.equal(result.retentionError, "r2_get_failed:0:TimeoutError");
+  assert.equal(result.retentionErrorKey, refs[0]!.key);
+  assert.equal(result.retentionFailureStage, "mark");
+  assert.equal(result.r2DeleteRequests, 0);
+  assert.equal(result.r2DeleteObjects, 0);
+  assert.equal(publisherStateForRetentionTest(store).lastRetentionAt, 0);
+  assert.notDeepEqual(await read(PUBLIC_EPG_CURRENT_KEY), pointerBefore);
+  assert.equal((await publishedObjects(store)).pointer.revision, result.revision);
+  assert.ok(progress.some((value) => value.phase === "publication" && value.published === true
+    && value.revision === result.revision));
+  assert.ok(progress.some((value) => value.phase === "retention" && value.retentionStatus === "failed"
+    && value.retentionError === result.retentionError && value.retentionErrorKey === refs[0]!.key
+    && value.retentionFailureStage === "mark"));
+
+  store.get = read;
+  const recovered = await runPublisher({ store, fetchImpl: upstream.fetch, now, leaseClock: () => clock + 1 });
+  assert.equal(recovered.published, false);
+  assert.equal(recovered.retentionStatus, "succeeded");
+  assert.equal(recovered.retentionError, null);
+  assert.equal(recovered.retentionErrorKey, null);
+  assert.equal(recovered.retentionFailureStage, null);
+  assert.equal(publisherStateForRetentionTest(store).lastRetentionAt, clock + 1);
+  assert.equal(recovered.revision, result.revision);
+});
+
+for (const changed of [true, false]) {
+  test(`retention list failure remains visible after ${changed ? "new" : "unchanged"} publication and recovers`, async () => {
+    const store = new MemoryObjectStore(), upstream = new FixedPublicUpstream();
+    const now = () => new Date("2026-10-01T12:00:00.000Z");
+    await runPublisher({ store, fetchImpl: upstream.fetch, now, leaseClock: () => 0 });
+    const pointerBefore = await store.get(PUBLIC_EPG_CURRENT_KEY);
+    if (changed) upstream.changedSourceIDs.add(publicEpgSources[0]!.id);
+    const orphanKey = PUBLIC_EPG_PREFIX + "objects/" + "f".repeat(64) + ".json.gz";
+    store.objects.set(orphanKey, {
+      value: new Uint8Array([1, 2, 3]),
+      metadata: { contentType: "application/json", contentEncoding: "gzip", cacheControl: "public, immutable" },
+      modifiedAt: 0
+    });
+    const list = store.list.bind(store);
+    let lists = 0;
+    store.list = async (prefix, cursor) => {
+      if (++lists === 2) throw new Error("r2_list_failed:503:Error");
+      return list(prefix, cursor);
+    };
+    const clock = 60 * 60 * 60 * 1_000;
+    const result = await runPublisher({ store, fetchImpl: upstream.fetch, now, leaseClock: () => clock });
+    assert.equal(result.published, changed);
+    assert.equal(result.retentionRan, true);
+    assert.equal(result.retentionStatus, "failed");
+    assert.equal(result.retentionError, "r2_list_failed:503:Error");
+    assert.equal(result.retentionErrorKey, null);
+    assert.equal(result.retentionFailureStage, "list");
+    assert.equal(result.r2DeleteRequests, 0);
+    assert.equal(result.r2DeleteObjects, 0);
+    assert.equal(store.objects.has(orphanKey), true, "incomplete enumeration must not delete any candidate");
+    assert.equal(publisherStateForRetentionTest(store).lastRetentionAt, 0);
+    const pointerAfter = await store.get(PUBLIC_EPG_CURRENT_KEY);
+    if (changed) assert.notDeepEqual(pointerAfter, pointerBefore);
+    else assert.deepEqual(pointerAfter, pointerBefore);
+    assert.equal((await publishedObjects(store)).pointer.revision, result.revision);
+
+    store.list = list;
+    const recovered = await runPublisher({ store, fetchImpl: upstream.fetch, now, leaseClock: () => clock + 1 });
+    assert.equal(recovered.published, false);
+    assert.equal(recovered.retentionRan, true);
+    assert.equal(recovered.retentionStatus, "succeeded");
+    assert.equal(recovered.retentionError, null);
+    assert.equal(recovered.retentionErrorKey, null);
+    assert.equal(recovered.retentionFailureStage, null);
+    assert.ok(recovered.retentionObjects > 0);
+    assert.ok((recovered.retentionNamespaceBytes ?? 0) > 0);
+    assert.equal(recovered.r2DeleteObjects, 1);
+    assert.equal(store.objects.has(orphanKey), false);
+    assert.equal(publisherStateForRetentionTest(store).lastRetentionAt, clock + 1);
+    assert.deepEqual(await store.get(PUBLIC_EPG_CURRENT_KEY), pointerAfter);
+  });
+}
+
+test("a completed retention sweep with a failed checkpoint preserves publication and retries the checkpoint next run", async () => {
+  const store = new MemoryObjectStore(), upstream = new FixedPublicUpstream();
+  const now = () => new Date("2026-10-01T12:00:00.000Z");
+  const orphanKey = PUBLIC_EPG_PREFIX + "objects/" + "f".repeat(64) + ".json.gz";
+  store.objects.set(orphanKey, {
+    value: new Uint8Array([1, 2, 3]),
+    metadata: { contentType: "application/json", contentEncoding: "gzip", cacheControl: "public, immutable" },
+    modifiedAt: 0
+  });
+  const write = store.putConditional.bind(store);
+  store.putConditional = async (key, value, metadata, condition) => {
+    if (key === PUBLIC_EPG_PUBLISHER_STATE_KEY
+      && JSON.parse(new TextDecoder().decode(value)).lastRetentionAt !== undefined) {
+      throw new Error("r2_put_failed");
+    }
+    return write(key, value, metadata, condition);
+  };
+  const clock = 60 * 60 * 60 * 1_000;
+  const progress: PublisherProgress[] = [];
+  const result = await runPublisher({ store, fetchImpl: upstream.fetch, now, leaseClock: () => clock,
+    onProgress: (value) => progress.push(value) });
+  assert.equal(result.published, true);
+  assert.equal(result.retentionRan, true);
+  assert.equal(result.retentionStatus, "failed");
+  assert.equal(result.retentionError, "r2_put_failed");
+  assert.equal(result.retentionErrorKey, PUBLIC_EPG_PUBLISHER_STATE_KEY);
+  assert.equal(result.retentionFailureStage, "checkpoint");
+  assert.equal(result.r2DeleteObjects, 1);
+  assert.ok(result.retentionObjects > 0, "completed sweep measurements survive checkpoint failure");
+  assert.ok((result.retentionNamespaceBytes ?? 0) > 0);
+  assert.equal(store.objects.has(orphanKey), false);
+  assert.equal(publisherStateForRetentionTest(store).lastRetentionAt, undefined,
+    "a failed checkpoint cannot suppress the next scheduled retention attempt");
+  const pointerAfter = await store.get(PUBLIC_EPG_CURRENT_KEY);
+  assert.equal((await publishedObjects(store)).pointer.revision, result.revision);
+  assert.ok(progress.some((value) => value.phase === "retention" && value.retentionStatus === "failed"
+    && value.retentionFailureStage === "checkpoint" && value.retentionErrorKey === PUBLIC_EPG_PUBLISHER_STATE_KEY));
+
+  store.putConditional = write;
+  const recovered = await runPublisher({ store, fetchImpl: upstream.fetch, now, leaseClock: () => clock + 1 });
+  assert.equal(recovered.published, false);
+  assert.equal(recovered.retentionStatus, "succeeded");
+  assert.equal(recovered.retentionError, null);
+  assert.equal(recovered.retentionErrorKey, null);
+  assert.equal(recovered.retentionFailureStage, null);
+  assert.equal(publisherStateForRetentionTest(store).lastRetentionAt, clock + 1);
+  assert.deepEqual(await store.get(PUBLIC_EPG_CURRENT_KEY), pointerAfter);
+});
+
+test("a lease renewal failure after sweeping is not attributed to the state checkpoint", async () => {
+  const store = new MemoryObjectStore(), upstream = new FixedPublicUpstream();
+  const list = store.list.bind(store), read = store.getWithETag.bind(store);
+  let lists = 0, failedRenewal = false;
+  store.list = async (...args) => { const page = await list(...args); lists++; return page; };
+  store.getWithETag = async (key, maximum) => {
+    if (lists >= 2 && !failedRenewal && key === PUBLIC_EPG_PREFIX + "publisher/lease.json") {
+      failedRenewal = true;
+      throw new Error("r2_get_failed:0:TimeoutError");
+    }
+    return read(key, maximum);
+  };
+  const result = await runPublisher({ store, fetchImpl: upstream.fetch,
+    now: () => new Date("2026-10-01T12:00:00.000Z") });
+  assert.equal(result.published, true);
+  assert.equal(result.retentionStatus, "failed");
+  assert.equal(result.retentionFailureStage, "checkpoint");
+  assert.equal(result.retentionError, "r2_get_failed:0:TimeoutError");
+  assert.equal(result.retentionErrorKey, null);
+  assert.ok(result.retentionObjects > 0);
+  assert.equal(publisherStateForRetentionTest(store).lastRetentionAt, undefined);
+  assert.equal((await publishedObjects(store)).pointer.revision, result.revision);
 });
